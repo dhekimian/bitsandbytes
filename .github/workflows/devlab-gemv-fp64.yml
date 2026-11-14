@@ -1,0 +1,164 @@
+# One-off accuracy check for the float32 test_gemv_4bit failures on ROCm.
+#
+# The test compares bitsandbytes' gemv_4bit against F.linear on the dequantized
+# weights (both on the GPU) with thresholds measured on an RTX 4090. This job
+# computes the same product in float64 on the CPU from the same dequantized
+# weights and inputs, and reports how far each GPU path is from it. If gemv_4bit
+# is as close to float64 as F.linear, the threshold is the problem; if it is
+# clearly worse, the kernel is less accurate.
+name: DevLab gemv_4bit fp32 vs fp64
+
+on:
+  workflow_dispatch:
+    inputs:
+      bnb_version:
+        description: bitsandbytes version from PyPI (empty = latest)
+        default: ""
+      torch_index_url:
+        description: Index torch comes from
+        default: https://download.pytorch.org/whl/rocm10.0
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.gpu }} (${{ matrix.gfx }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gpu: strix-halo
+            gfx: gfx1151
+          - gpu: radeon-r9700
+            gfx: gfx1201
+    runs-on: [self-hosted, Linux, devlab-dispatch, "${{ matrix.gpu }}"]
+    timeout-minutes: 30
+    env:
+      BNB_VERSION: ${{ inputs.bnb_version }}
+      TORCH_SPEC: torch
+      TORCH_INDEX_URL: ${{ inputs.torch_index_url }}
+      TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
+    steps:
+      - name: Install torch and bitsandbytes
+        id: install
+        run: |
+          set -euo pipefail
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install -q --upgrade pip
+          spec="${TORCH_SPEC//\{gfx\}/${{ matrix.gfx }}}"     # torch[device-{gfx}] for TheRock
+          INDEX="$TORCH_INDEX_URL"
+          # A runner pool with a package mirror maps public indexes to it with the
+          # TORCH_INDEX_MAP repository variable (JSON: index URL -> mirror URL).
+          # Unset, the index is used as given.
+          EXTRA=()
+          if [ -n "${TORCH_INDEX_MAP:-}" ]; then
+            idx_in="$INDEX"
+            # A value is a mirror URL, or a list [index, extra index, ...] when the
+            # mirror serves the index's packages from more than one repository.
+            idx=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1]); u=sys.argv[2]; v=m.get(u.rstrip("/")+"/", m.get(u.rstrip("/"), u)); print("\n".join([v] if isinstance(v, str) else v))' "$TORCH_INDEX_MAP" "$INDEX")
+            mapfile -t idx <<<"$idx"
+            INDEX="${idx[0]}"
+            for e in "${idx[@]:1}"; do EXTRA+=(--extra-index-url "$e"); done
+            [ "$INDEX" = "$idx_in" ] && [ ${#idx[@]} -eq 1 ] || echo "torch index mapped: $idx_in -> $INDEX${EXTRA:+ (extra: ${idx[*]:1})}"
+          fi
+          echo "torch: $spec from $INDEX"
+          # PIP_CONFIG_FILE=/dev/null: a runner's pip.conf may add PyPI as an
+          # extra index, and PyPI's newer CUDA torch then outranks the ROCm build.
+          PIP_CONFIG_FILE=/dev/null pip install -q "$spec" --index-url "$INDEX" "${EXTRA[@]}"
+          # Pin the torch stack for every later pip call: a package that depends on
+          # torch can otherwise replace the ROCm build with a CUDA wheel from PyPI,
+          # and the tests run on the CPU.
+          pip freeze | grep -iE '^(torch|torchvision|torchaudio|triton|pytorch-triton-rocm|rocm[a-z0-9_-]*)==' \
+            > "$RUNNER_TEMP/torch-pin.txt"
+          cat "$RUNNER_TEMP/torch-pin.txt"
+          export PIP_CONSTRAINT="$RUNNER_TEMP/torch-pin.txt"
+          echo "PIP_CONSTRAINT=$PIP_CONSTRAINT" >> "$GITHUB_ENV"
+          pip install -q "bitsandbytes${BNB_VERSION:+==$BNB_VERSION}" scipy
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, torch, bitsandbytes as bnb
+          from bitsandbytes.cextension import lib
+          assert torch.version.hip, f"not a ROCm build of torch: {torch.__version__}"
+          p = torch.cuda.get_device_properties(0)
+          libname = getattr(getattr(lib, "_lib", None), "_name", "") or ""
+          info = {"torch": torch.__version__, "hip": torch.version.hip, "device": p.name,
+                  "arch": p.gcnArchName, "bitsandbytes": bnb.__version__, "native_lib": libname}
+          json.dump(info, open("env.json", "w"))
+          import sys; print(info, file=sys.stderr)
+          # A CPU or CUDA build would make this job test something else.
+          assert "rocm" in libname, f"ROCm native library not loaded: {libname!r}"
+          assert "${{ matrix.gfx }}" in p.gcnArchName, f"expected ${{ matrix.gfx }}, got {p.gcnArchName}"
+          print(f"version={bnb.__version__}")
+          PY
+
+      - name: Compare with a float64 reference
+        run: |
+          . venv/bin/activate
+          python -u - <<'PY'
+          import faulthandler, json, math
+          faulthandler.enable()
+          import torch
+          import bitsandbytes.functional as F
+
+          torch.backends.cuda.matmul.allow_tf32 = False
+          dev = "cuda"
+          iters = 100
+          results = []
+          # (dim, kind): failing float32 cases in test_gemv_4bit, plus one passing control.
+          cases = [(128, "fc2"), (1024, "fc2"), (1024, "fc1"), (128, "fc1")]
+          for dim, kind in cases:
+              for qt in ("nf4", "fp4"):
+                  for dq in (False, True):
+                      torch.manual_seed(0)
+                      acc = {k: [] for k in ("gemv_mean", "gemv_max", "linear_mean", "linear_max",
+                                              "gemv_vs_linear_mean", "cpu32_mean")}
+                      for _ in range(iters):
+                          if kind == "fc1":
+                              A = torch.randn(1, dim, device=dev)
+                              B = torch.randn(dim * 4, dim, device=dev) / math.sqrt(dim)
+                          else:
+                              A = torch.randn(1, 4 * dim, device=dev)
+                              B = torch.randn(dim, 4 * dim, device=dev) / math.sqrt(dim)
+                          qB, state = F.quantize_4bit(B, quant_type=qt, compress_statistics=dq,
+                                                      quant_storage=torch.uint8)
+                          W = F.dequantize_4bit(qB, state).to(torch.float32)
+                          C1 = torch.nn.functional.linear(A, W)            # the test's reference
+                          C2 = F.gemv_4bit(A, qB.t(), state=state)         # bitsandbytes' kernel
+                          ref = A.double().cpu() @ W.double().cpu().t()    # float64, same inputs
+                          c32 = A.cpu() @ W.cpu().t()                      # CPU float32, for scale
+                          e2 = (C2.double().cpu() - ref).abs()
+                          e1 = (C1.double().cpu() - ref).abs()
+                          acc["gemv_mean"].append(e2.mean().item())
+                          acc["gemv_max"].append(e2.max().item())
+                          acc["linear_mean"].append(e1.mean().item())
+                          acc["linear_max"].append(e1.max().item())
+                          acc["gemv_vs_linear_mean"].append((C1 - C2).abs().float().mean().item())
+                          acc["cpu32_mean"].append((c32.double() - ref).abs().mean().item())
+                      r = {"dim": dim, "kind": kind, "quant": qt, "dq": dq,
+                           "k": dim if kind == "fc1" else 4 * dim}
+                      # Same normalisation as the test: mean over iterations / sqrt(dim).
+                      for k, v in acc.items():
+                          r[k] = sum(v) / len(v) / math.sqrt(dim)
+                      r["gemv_over_linear"] = r["gemv_mean"] / r["linear_mean"]
+                      results.append(r)
+                      print(f"dim={dim:5d} {kind} {qt} dq={dq!s:5} K={r['k']:5d} | vs fp64 mean/sqrt(dim): "
+                            f"gemv {r['gemv_mean']:.2e}  F.linear {r['linear_mean']:.2e}  cpu fp32 {r['cpu32_mean']:.2e}"
+                            f"  ratio gemv/linear {r['gemv_over_linear']:.2f} | max: gemv {r['gemv_max']:.2e}"
+                            f" linear {r['linear_max']:.2e} | test err1 {r['gemv_vs_linear_mean']:.2e}")
+          env = json.load(open("env.json"))
+          json.dump({"schema": 1, "project": "bitsandbytes", "label": "gemv-fp64",
+                     "release": env["bitsandbytes"], "combo": f"torch{env['torch']}",
+                     "gpu": "${{ matrix.gpu }}", "gfx": "${{ matrix.gfx }}", "env": env,
+                     "smoke": None, "tests": None, "gemv_fp64": results,
+                     "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"},
+                    open("summary.json", "w"), indent=1)
+          PY
+
+      - name: Upload the run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devlab-summary-gemv-fp64-${{ strategy.job-index }}-${{ matrix.gpu }}-${{ github.run_attempt }}
+          path: summary.json
+          retention-days: 90
