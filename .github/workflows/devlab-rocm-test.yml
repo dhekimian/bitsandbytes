@@ -66,6 +66,13 @@ jobs:
       BNB_TEST_DEVICE: cuda
       SAMPLER_DIR: ${{ github.workspace }}/../devlab-sampler
     steps:
+      - name: Get the known-failures list
+        uses: actions/checkout@v4
+        with:
+          path: devlab-config
+          sparse-checkout: .github/devlab-known-failures.txt
+          sparse-checkout-cone-mode: false
+
       - name: Write the test sampler
         run: |
           # A pytest plugin that keeps a deterministic sample at collection time:
@@ -159,6 +166,7 @@ jobs:
           echo "tests from ${{ steps.install.outputs.version }}"
 
       - name: Tests (deterministic sample)
+        id: tests
         working-directory: src
         run: |
           set -euo pipefail
@@ -166,9 +174,76 @@ jobs:
           # Serial: the cases share one GPU and several allocate most of it.
           k=()
           [ -z "$PYTEST_K" ] || k=(-k "$PYTEST_K")
+          # Test failures do not fail this step; "Judge results" decides, so that
+          # known upstream failures show as warnings rather than errors.
+          rc=0
           PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
             python -m pytest tests -p devlab_sample -q -rfE -p no:cacheprovider --timeout=900 \
-            --junitxml=../junit.xml "${k[@]}"
+            --junitxml=../junit.xml "${k[@]}" || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "pytest exit code: $rc"
+
+      - name: Judge results
+        if: always()
+        env:
+          TESTS_RC: ${{ steps.tests.outputs.rc }}
+        run: |
+          python3 - <<'PY'
+          import fnmatch, json, os, sys, xml.etree.ElementTree as ET
+          known = []
+          kf = "devlab-config/.github/devlab-known-failures.txt"
+          if os.path.exists(kf):
+              for line in open(kf):
+                  line = line.strip()
+                  if line and not line.startswith("#"):
+                      pat, reason, issue = ([p.strip() for p in line.split("|")] + ["", ""])[:3]
+                      known.append((pat, reason, issue or "not filed"))
+          rc = os.environ.get("TESTS_RC", "")
+          out = {"verdict": "fail", "known_failures": [], "new_failures": [], "reason": ""}
+
+          def nodeid(case):
+              # junit classname "tests.test_x.Class" -> "tests/test_x.py::Class::name"
+              parts = (case.get("classname") or "").split(".")
+              for i in range(len(parts), 0, -1):
+                  path = "/".join(parts[:i]) + ".py"
+                  if os.path.exists(os.path.join("src", path)):
+                      return "::".join([path] + parts[i:] + [case.get("name")])
+              return "::".join(parts + [case.get("name")])
+
+          # pytest exit codes: 0 all passed, 1 some tests failed; anything else means the
+          # run itself broke (interrupted, internal error, usage error, nothing collected).
+          if rc not in ("0", "1") or not os.path.exists("junit.xml"):
+              out["reason"] = f"tests did not run (pytest exit code {rc or 'none'}, junit {'present' if os.path.exists('junit.xml') else 'missing'})"
+          else:
+              failed = []
+              for case in ET.parse("junit.xml").getroot().iter("testcase"):
+                  if case.find("failure") is not None or case.find("error") is not None:
+                      failed.append(nodeid(case))
+              summary = []
+              for nid in failed:
+                  hit = next((k for k in known if fnmatch.fnmatchcase(nid, k[0])), None)
+                  if hit:
+                      out["known_failures"].append(nid)
+                      print(f"::warning title=Known upstream failure::{nid} — {hit[1]} ({hit[2]})")
+                      summary.append(f"- :warning: known upstream: `{nid}` — {hit[1]} ({hit[2]})")
+                  else:
+                      out["new_failures"].append(nid)
+                      print(f"::error title=New failure::{nid}")
+                      summary.append(f"- :x: new: `{nid}`")
+              if rc == "1" and not failed:
+                  out["reason"] = "pytest reported failures but junit lists none"
+              elif out["new_failures"]:
+                  out["reason"] = f"{len(out['new_failures'])} new failure(s)"
+              else:
+                  out["verdict"] = "known-failures" if out["known_failures"] else "pass"
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(f"### ${{ matrix.gpu }} (${{ matrix.gfx }}): {out['verdict']}\n\n" + "\n".join(summary) + "\n")
+          json.dump(out, open("judge.json", "w"), indent=1)
+          print(json.dumps(out, indent=1))
+          if out["verdict"] == "fail":
+              print(f"::error title=Judge::{out['reason']}")
+              sys.exit(1)
+          PY
 
       - name: Write the run summary
         if: always()
@@ -190,6 +265,7 @@ jobs:
                        "passed": n["tests"] - n["failures"] - n["errors"] - n["skipped"],
                        "seconds": round(float(s.get("time", 0)), 1)}
           env = load("env.json") or {}
+          judge = load("judge.json") or {}
           summary = {
               "schema": 1, "project": "bitsandbytes", "label": os.environ["LABEL"],
               "release": env.get("bitsandbytes", os.environ.get("BNB_VERSION", "")),
@@ -197,6 +273,9 @@ jobs:
               "torch_spec": os.environ.get("TORCH_SPEC", ""), "gpu": "${{ matrix.gpu }}",
               "gfx": "${{ matrix.gfx }}", "env": env or None, "smoke": None, "tests": tests,
               "job_status": "${{ job.status }}",
+              "verdict": judge.get("verdict", "fail"),
+              "known_failures": judge.get("known_failures", []),
+              "new_failures": judge.get("new_failures", []),
               "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
               "finished": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
           }

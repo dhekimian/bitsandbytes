@@ -1,0 +1,13 @@
+# Known upstream failures: a matching failed test is a warning (yellow), not an error.
+# One entry per line: <fnmatch pattern on the pytest node id> | <reason> | <upstream issue URL or "not filed">
+# fnmatch reads "[" as a character class, so "?" stands in for the "[" before parameters.
+# List a failure here only once it is classified as an upstream issue, never for a setup bug of ours.
+
+# The tests set BNB_CUDA_VERSION but do not patch torch.version.hip; on ROCm torch the rocm prefix and BNB_ROCM_VERSION apply.
+tests/test_cuda_setup_evaluator.py::test_override | test assumes CUDA torch (does not patch torch.version.hip) | not filed
+tests/test_cuda_setup_evaluator.py::test_override_invalid_format | test assumes CUDA torch (does not patch torch.version.hip) | not filed
+
+# float32 thresholds measured on an RTX 4090; ROCm exceeds them by a few float32 roundings on long inner reductions.
+tests/test_functional.py::TestQuantize4BitFunctional::test_gemv_4bit?dim=*-fp32-fc2-* | fp32 gemv tolerance tuned on RTX 4090 (summation order) | not filed
+tests/test_functional.py::TestQuantize4BitFunctional::test_gemv_4bit?dim=1024-fp32-fc1-* | fp32 gemv tolerance tuned on RTX 4090 (summation order) | not filed
+tests/test_functional.py::TestQuantize4BitFunctional::test_gemv_4bit?dim=1024-fp32-attn_packed-* | fp32 gemv tolerance tuned on RTX 4090 (summation order) | not filed
