@@ -26,8 +26,11 @@ on:
         description: Index torch comes from
         default: https://download.pytorch.org/whl/rocm10.0
       tests_per_file:
-        description: Test cases to run per test file
+        description: Test cases to run per test file (0 = all)
         default: "60"
+      pytest_k:
+        description: Optional pytest -k expression (e.g. to rerun one failing test in full)
+        default: ""
   workflow_call:
     inputs:
       bnb_version: {type: string, default: ""}
@@ -57,6 +60,7 @@ jobs:
       TORCH_SPEC: ${{ inputs.torch_spec || 'torch' }}
       TORCH_INDEX_URL: ${{ inputs.torch_index_url || 'https://download.pytorch.org/whl/rocm10.0' }}
       PER_FILE: ${{ inputs.tests_per_file || '60' }}
+      PYTEST_K: ${{ inputs.pytest_k || '' }}
       LABEL: ${{ inputs.label || 'release' }}
       TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
       BNB_TEST_DEVICE: cuda
@@ -108,7 +112,9 @@ jobs:
             [ "$INDEX" = "$idx_in" ] || echo "torch index mapped: $idx_in -> $INDEX"
           fi
           echo "torch: $spec from $INDEX"
-          pip install -q "$spec" --index-url "$INDEX"
+          # PIP_CONFIG_FILE=/dev/null: a runner's pip.conf may add PyPI as an
+          # extra index, and PyPI's newer CUDA torch then outranks the ROCm build.
+          PIP_CONFIG_FILE=/dev/null pip install -q "$spec" --index-url "$INDEX"
           # Pin the torch stack for every later pip call: a package that depends on
           # torch can otherwise replace the ROCm build with a CUDA wheel from PyPI,
           # and the tests run on the CPU.
@@ -117,8 +123,8 @@ jobs:
           cat "$RUNNER_TEMP/torch-pin.txt"
           export PIP_CONSTRAINT="$RUNNER_TEMP/torch-pin.txt"
           echo "PIP_CONSTRAINT=$PIP_CONSTRAINT" >> "$GITHUB_ENV"
-          pip install -q "bitsandbytes${BNB_VERSION:+==$BNB_VERSION}" pytest pytest-xdist pytest-timeout \
-            einops scipy lion-pytorch transformers
+          # The release's own [test] extra pins its test dependencies (e.g. transformers<5).
+          pip install -q "bitsandbytes[test]${BNB_VERSION:+==$BNB_VERSION}" pytest-timeout
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import json, torch, bitsandbytes as bnb
           from bitsandbytes.cextension import lib
@@ -141,7 +147,9 @@ jobs:
           git init -q src && cd src
           git remote add origin https://github.com/bitsandbytes-foundation/bitsandbytes.git
           git fetch -q --depth 1 origin "refs/tags/${{ steps.install.outputs.version }}"
-          git checkout -q FETCH_HEAD -- tests pytest.ini 2>/dev/null || git checkout -q FETCH_HEAD -- tests
+          # pyproject.toml carries the pytest config: addopts deselects the slow,
+          # benchmark and deprecated tests, as upstream CI does.
+          git checkout -q FETCH_HEAD -- tests pyproject.toml
           echo "tests from ${{ steps.install.outputs.version }}"
 
       - name: Tests (deterministic sample)
@@ -150,9 +158,11 @@ jobs:
           set -euo pipefail
           . ../venv/bin/activate
           # Serial: the cases share one GPU and several allocate most of it.
+          k=()
+          [ -z "$PYTEST_K" ] || k=(-k "$PYTEST_K")
           PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
-            python -m pytest tests -p devlab_sample -q -rf -p no:cacheprovider --timeout=900 \
-            --junitxml=../junit.xml
+            python -m pytest tests -p devlab_sample -q -rfE -p no:cacheprovider --timeout=900 \
+            --junitxml=../junit.xml "${k[@]}"
 
       - name: Write the run summary
         if: always()
