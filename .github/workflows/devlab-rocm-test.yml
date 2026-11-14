@@ -1,0 +1,162 @@
+# Run bitsandbytes' own test suite on real consumer AMD GPUs.
+#
+# bitsandbytes ships ROCm builds in its PyPI wheels (since 0.49), but CI tests
+# CUDA only (test-runner.yml takes cpu|cuda). This job installs a released
+# wheel with ROCm torch on a Radeon 8060S (Strix Halo, gfx1151) and a Radeon AI
+# PRO R9700 (gfx1201), checks that the ROCm build of the native library is the
+# one loaded, and runs a deterministic sample of the release's own tests.
+#
+# Every run uploads summary-*.json (versions, device, pass/fail counts) so
+# results compare across releases; other workflows call this one for a
+# version matrix (workflow_call).
+#
+# Runners: AMD DevLab, a donated pool of ephemeral, single-use machines. One
+# job per machine; nothing persists between jobs.
+name: ROCm test (gfx1151, gfx1201)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      bnb_version:
+        description: bitsandbytes version from PyPI (empty = latest)
+        default: ""
+      torch_index_url:
+        description: Index torch comes from
+        default: https://download.pytorch.org/whl/rocm10.0
+      tests_per_file:
+        description: Test cases to run per test file
+        default: "60"
+  workflow_call:
+    inputs:
+      bnb_version: {type: string, default: ""}
+      torch_spec: {type: string, default: "torch"}
+      torch_index_url: {type: string, default: https://download.pytorch.org/whl/rocm10.0}
+      tests_per_file: {type: string, default: "60"}
+      label: {type: string, default: release}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.gpu }} (${{ matrix.gfx }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gpu: strix-halo
+            gfx: gfx1151
+          - gpu: radeon-r9700
+            gfx: gfx1201
+    runs-on: [self-hosted, Linux, devlab-dispatch, "${{ matrix.gpu }}"]
+    timeout-minutes: 75
+    env:
+      BNB_VERSION: ${{ github.event.release.tag_name || inputs.bnb_version || '' }}
+      TORCH_SPEC: ${{ inputs.torch_spec || 'torch' }}
+      TORCH_INDEX_URL: ${{ inputs.torch_index_url || 'https://download.pytorch.org/whl/rocm10.0' }}
+      PER_FILE: ${{ inputs.tests_per_file || '60' }}
+      LABEL: ${{ inputs.label || 'release' }}
+      BNB_TEST_DEVICE: cuda
+    steps:
+      - name: Install torch and bitsandbytes
+        id: install
+        run: |
+          set -euo pipefail
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install -q --upgrade pip
+          spec="${TORCH_SPEC//\{gfx\}/${{ matrix.gfx }}}"     # torch[device-{gfx}] for TheRock
+          echo "torch: $spec from $TORCH_INDEX_URL"
+          pip install -q "$spec" --index-url "$TORCH_INDEX_URL"
+          pip install -q "bitsandbytes${BNB_VERSION:+==$BNB_VERSION}" pytest pytest-xdist pytest-timeout \
+            einops scipy lion-pytorch transformers
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, torch, bitsandbytes as bnb
+          from bitsandbytes.cextension import lib
+          p = torch.cuda.get_device_properties(0)
+          libname = getattr(getattr(lib, "_lib", None), "_name", "") or ""
+          info = {"torch": torch.__version__, "hip": torch.version.hip, "device": p.name,
+                  "arch": p.gcnArchName, "bitsandbytes": bnb.__version__, "native_lib": libname}
+          json.dump(info, open("env.json", "w"))
+          import sys; print(info, file=sys.stderr)
+          # A CPU or CUDA build would make this job test something else.
+          assert "rocm" in libname, f"ROCm native library not loaded: {libname!r}"
+          assert "${{ matrix.gfx }}" in p.gcnArchName, f"expected ${{ matrix.gfx }}, got {p.gcnArchName}"
+          print(f"version={bnb.__version__}")
+          PY
+
+      - name: Fetch the release's tests
+        run: |
+          set -euo pipefail
+          git init -q src && cd src
+          git remote add origin https://github.com/bitsandbytes-foundation/bitsandbytes.git
+          git fetch -q --depth 1 origin "refs/tags/${{ steps.install.outputs.version }}"
+          git checkout -q FETCH_HEAD -- tests pytest.ini 2>/dev/null || git checkout -q FETCH_HEAD -- tests
+          echo "tests from ${{ steps.install.outputs.version }}"
+
+      - name: Tests (deterministic sample)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          . ../venv/bin/activate
+          python -m pytest tests --collect-only -q -p no:cacheprovider 2>/dev/null | grep '::' > all-tests.txt
+          python - "$PER_FILE" <<'PY' > sample.txt
+          import sys
+          from collections import defaultdict
+          per = int(sys.argv[1])
+          by_file = defaultdict(list)
+          for line in open("all-tests.txt"):
+              node = line.strip()
+              by_file[node.split("::")[0]].append(node)
+          for f, nodes in sorted(by_file.items()):
+              step = max(1, len(nodes) // per)
+              for n in nodes[::step][:per]:
+                  print(n)
+          PY
+          echo "running $(wc -l < sample.txt) of $(wc -l < all-tests.txt) collected cases"
+          python -m pytest -q -rf -p no:cacheprovider -n 2 --timeout=900 \
+            --junitxml=../junit.xml $(cat sample.txt)
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime, xml.etree.ElementTree as ET
+          def load(p):
+              try:
+                  return json.load(open(p))
+              except Exception:
+                  return None
+          tests = None
+          if os.path.exists("junit.xml"):
+              s = ET.parse("junit.xml").getroot()
+              s = s if s.tag == "testsuite" else s.find("testsuite")
+              n = {k: int(s.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+              tests = {"ran": n["tests"], "failed": n["failures"], "errors": n["errors"],
+                       "skipped": n["skipped"],
+                       "passed": n["tests"] - n["failures"] - n["errors"] - n["skipped"],
+                       "seconds": round(float(s.get("time", 0)), 1)}
+          env = load("env.json") or {}
+          summary = {
+              "schema": 1, "project": "bitsandbytes", "label": os.environ["LABEL"],
+              "release": env.get("bitsandbytes", os.environ.get("BNB_VERSION", "")),
+              "combo": f"torch{(env.get('torch') or '?')}",
+              "torch_spec": os.environ.get("TORCH_SPEC", ""), "gpu": "${{ matrix.gpu }}",
+              "gfx": "${{ matrix.gfx }}", "env": env or None, "smoke": None, "tests": tests,
+              "job_status": "${{ job.status }}",
+              "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "finished": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+          }
+          json.dump(summary, open("summary.json", "w"), indent=1)
+          print(json.dumps(summary, indent=1))
+          PY
+
+      - name: Upload the run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devlab-summary-${{ inputs.label || 'release' }}-${{ strategy.job-index }}-${{ matrix.gpu }}-${{ github.run_attempt }}
+          path: summary.json
+          retention-days: 90
