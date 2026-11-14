@@ -22,9 +22,15 @@ on:
       bnb_version:
         description: bitsandbytes version from PyPI (empty = latest)
         default: ""
+      torch_spec:
+        description: torch requirement ({gfx} = the job's chip, e.g. torch[device-{gfx}])
+        default: torch
       torch_index_url:
         description: Index torch comes from
         default: https://download.pytorch.org/whl/rocm10.0
+      label:
+        description: Label for summary.json and the artifact name
+        default: release
       tests_per_file:
         description: Test cases to run per test file (0 = all)
         default: "60"

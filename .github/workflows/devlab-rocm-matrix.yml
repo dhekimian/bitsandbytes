@@ -20,6 +20,9 @@ jobs:
         include:
           - {name: rocm10.0, spec: "torch", index: "https://download.pytorch.org/whl/rocm10.0"}
           - {name: rocm7.2, spec: "torch", index: "https://download.pytorch.org/whl/rocm7.2"}
+          - {name: rocm7.14, spec: "torch", index: "https://download.pytorch.org/whl/rocm7.14"}
+          # AMD's stable ROCm 10.1 build of torch (TheRock); {gfx} picks each job's chip package.
+          - {name: rocm10.1, spec: "torch[device-{gfx}]==2.14.0+rocm10.1.0", index: "https://stable.repo.amd.com/rocm/whl-next/"}
           # TheRock pre-release: the next ROCm; {gfx} picks each job's chip package.
           - {name: rocm-next, spec: "torch[device-{gfx}]", index: "https://rc.repo.amd.com/rocm/whl-next/"}
     uses: ./.github/workflows/devlab-rocm-test.yml
