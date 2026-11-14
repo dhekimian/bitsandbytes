@@ -60,7 +60,36 @@ jobs:
       LABEL: ${{ inputs.label || 'release' }}
       TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
       BNB_TEST_DEVICE: cuda
+      SAMPLER_DIR: ${{ github.workspace }}/../devlab-sampler
     steps:
+      - name: Write the test sampler
+        run: |
+          # A pytest plugin that keeps a deterministic sample at collection time:
+          # every pytest-xdist worker selects the same tests, and node ids never
+          # pass through the shell.
+          mkdir -p "$SAMPLER_DIR"
+          cat > "$SAMPLER_DIR/devlab_sample.py" <<'PY'
+          import os
+          from collections import defaultdict
+
+
+          def pytest_collection_modifyitems(config, items):
+              per = int(os.environ.get("DEVLAB_PER") or 0)
+              if per <= 0:
+                  return
+              by_file = os.environ.get("DEVLAB_GROUP", "function") == "file"
+              groups = defaultdict(list)
+              for item in items:
+                  nodeid = item.nodeid
+                  groups[nodeid.split("::")[0] if by_file else nodeid.split("[")[0]].append(item)
+              keep = set()
+              for members in groups.values():
+                  step = max(1, len(members) // per)
+                  keep.update(id(i) for i in members[::step][:per])
+              config.hook.pytest_deselected(items=[i for i in items if id(i) not in keep])
+              items[:] = [i for i in items if id(i) in keep]
+          PY
+
       - name: Install torch and bitsandbytes
         id: install
         run: |
@@ -80,11 +109,20 @@ jobs:
           fi
           echo "torch: $spec from $INDEX"
           pip install -q "$spec" --index-url "$INDEX"
+          # Pin the torch stack for every later pip call: a package that depends on
+          # torch can otherwise replace the ROCm build with a CUDA wheel from PyPI,
+          # and the tests run on the CPU.
+          pip freeze | grep -iE '^(torch|torchvision|torchaudio|triton|pytorch-triton-rocm|rocm[a-z0-9_-]*)==' \
+            > "$RUNNER_TEMP/torch-pin.txt"
+          cat "$RUNNER_TEMP/torch-pin.txt"
+          export PIP_CONSTRAINT="$RUNNER_TEMP/torch-pin.txt"
+          echo "PIP_CONSTRAINT=$PIP_CONSTRAINT" >> "$GITHUB_ENV"
           pip install -q "bitsandbytes${BNB_VERSION:+==$BNB_VERSION}" pytest pytest-xdist pytest-timeout \
             einops scipy lion-pytorch transformers
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import json, torch, bitsandbytes as bnb
           from bitsandbytes.cextension import lib
+          assert torch.version.hip, f"not a ROCm build of torch: {torch.__version__}"
           p = torch.cuda.get_device_properties(0)
           libname = getattr(getattr(lib, "_lib", None), "_name", "") or ""
           info = {"torch": torch.__version__, "hip": torch.version.hip, "device": p.name,
@@ -111,25 +149,10 @@ jobs:
         run: |
           set -euo pipefail
           . ../venv/bin/activate
-          python -m pytest tests --collect-only -q -p no:cacheprovider 2>/dev/null | grep '::' > all-tests.txt
-          python - "$PER_FILE" <<'PY' > sample.txt
-          import sys
-          from collections import defaultdict
-          per = int(sys.argv[1])
-          by_file = defaultdict(list)
-          for line in open("all-tests.txt"):
-              node = line.strip()
-              by_file[node.split("::")[0]].append(node)
-          for f, nodes in sorted(by_file.items()):
-              step = max(1, len(nodes) // per)
-              for n in nodes[::step][:per]:
-                  print(n)
-          PY
-          echo "running $(wc -l < sample.txt) of $(wc -l < all-tests.txt) collected cases"
-          # Serial: under xdist each worker re-collects, and ids that differ between
-          # collections (the sample was taken from this one) matched nothing.
-          python -m pytest -q -rf -p no:cacheprovider --timeout=900 \
-            --junitxml=../junit.xml $(cat sample.txt)
+          # Serial: the cases share one GPU and several allocate most of it.
+          PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
+            python -m pytest tests -p devlab_sample -q -rf -p no:cacheprovider --timeout=900 \
+            --junitxml=../junit.xml
 
       - name: Write the run summary
         if: always()
