@@ -116,7 +116,9 @@ jobs:
                   print(n)
           PY
           echo "running $(wc -l < sample.txt) of $(wc -l < all-tests.txt) collected cases"
-          python -m pytest -q -rf -p no:cacheprovider -n 2 --timeout=900 \
+          # Serial: under xdist each worker re-collects, and ids that differ between
+          # collections (the sample was taken from this one) matched nothing.
+          python -m pytest -q -rf -p no:cacheprovider --timeout=900 \
             --junitxml=../junit.xml $(cat sample.txt)
 
       - name: Write the run summary
